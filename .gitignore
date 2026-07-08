@@ -1,0 +1,22 @@
+# 运行产物
+_work/
+*.m4a
+*.mp3
+*.wav
+transcript.txt
+transcript.srt
+*_raw_result.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 密钥（务必不要提交）
+.env
+*.key
+
+# 系统
+.DS_Store
+Thumbs.db
