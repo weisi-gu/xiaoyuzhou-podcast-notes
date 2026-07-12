@@ -39,6 +39,20 @@ def write_outputs(out_dir, segments):
             fs.write(f"{i}\n{fmt_ts(start)} --> {fmt_ts(end)}\n{text}\n\n")
     print(f"[完成] 转录文本 -> {txt}")
     print(f"       字幕     -> {srt}")
+    _quality_hint(segments)
+
+
+def _quality_hint(segments):
+    """转录后粗略自检：英文/字母占比过高时，提示中英混或可考虑用 fun-asr 重转。"""
+    full = "".join((t or "") for _, _, t in segments)
+    chars = [c for c in full if not c.isspace()]
+    if not chars:
+        return
+    latin = sum(1 for c in chars if ("a" <= c.lower() <= "z"))
+    ratio = latin / len(chars)
+    if ratio >= 0.12:
+        print(f"    ⚠️ 英文/字母占比约 {ratio:.0%}，这期可能中英混较多或含较多专名。"
+              f"若识别不准，建议用 --backend funasr 重转，并可配热词表(--vocabulary-id)提升人名/术语。")
 
 
 def _http_json(url, headers, data=None, method=None, timeout=60):
@@ -176,9 +190,10 @@ def run_funasr(audio_url, out_dir, model, language, region, diarize, speaker_cou
     if vocabulary_id:
         params["vocabulary_id"] = vocabulary_id
     if language:
-        params["language_hints"] = [language]
+        # 带上 en 有助于中英混杂识别（paraformer-v2 尤其受益）
+        params["language_hints"] = [language, "en"] if language != "en" else ["en"]
     payload = {"model": model, "input": {"file_urls": [audio_url]}, "parameters": params}
-    print(f"[转录] Fun-ASR {model} ({region})，说话人分离={'开' if diarize else '关'}")
+    print(f"[转录] {model} ({region})，说话人分离={'开' if diarize else '关'}")
     if diarize:
         print("    注意：开启说话人分离建议音频≤2小时，且仅支持单声道。")
     result = _submit_and_poll(submit_url, task_base, key, payload, out_dir)
@@ -231,17 +246,17 @@ def main():
     ap.add_argument("--from-raw", default=None,
                     help="从已保存的 dashscope_raw_result.json 恢复解析（任务已成功、不重新转录、不重复计费）")
     ap.add_argument("--out", default="./_work")
-    ap.add_argument("--backend", choices=["qwen", "funasr", "api"],
+    ap.add_argument("--backend", choices=["qwen", "funasr", "paraformer", "api"],
                     default="qwen")
     ap.add_argument("--model", default=None,
-                    help="qwen默认 qwen3-asr-flash-filetrans；funasr默认 fun-asr；api默认 whisper-large-v3")
+                    help="qwen默认 qwen3-asr-flash-filetrans；funasr默认 fun-asr；paraformer默认 paraformer-v2；api默认 whisper-large-v3")
     ap.add_argument("--language", default="zh")
     ap.add_argument("--region", choices=["cn", "intl"], default="cn",
                     help="云端地域：cn=北京，intl=新加坡（API Key 不同）")
-    # fun-asr 专用
-    ap.add_argument("--diarize", action="store_true", help="funasr: 开启说话人分离")
-    ap.add_argument("--speaker-count", type=int, default=None, help="funasr: 说话人数量提示(2-100)")
-    ap.add_argument("--vocabulary-id", default=None, help="funasr: 热词表ID(vocabulary_id)")
+    # funasr / paraformer 专用（两者用法一致）
+    ap.add_argument("--diarize", action="store_true", help="funasr/paraformer: 开启说话人分离")
+    ap.add_argument("--speaker-count", type=int, default=None, help="说话人数量提示(2-100)")
+    ap.add_argument("--vocabulary-id", default=None, help="热词表ID(vocabulary_id)，funasr/paraformer 支持")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -275,6 +290,10 @@ def main():
                  args.language, args.region)
     elif args.backend == "funasr":
         run_funasr(audio, args.out, args.model or "fun-asr", args.language,
+                   args.region, args.diarize, args.speaker_count, args.vocabulary_id)
+    elif args.backend == "paraformer":
+        # paraformer 与 fun-asr 用法一致（同接口/同参数），仅换模型名
+        run_funasr(audio, args.out, args.model or "paraformer-v2", args.language,
                    args.region, args.diarize, args.speaker_count, args.vocabulary_id)
     else:
         run_api(audio, args.out, args.model or "whisper-large-v3", args.language)
