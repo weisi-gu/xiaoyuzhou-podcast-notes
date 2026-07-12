@@ -78,6 +78,14 @@ python scripts/transcribe.py --from-meta ./_work --out ./_work --backend parafor
 - **中英混重 / 音质差 / 想要高质量的少数期 → `funasr`（对谈）或 `qwen`（单人）**，把它们那笔 90 天一次性额度用在刀刃上。
 - 转录后脚本会做一次**质量自检**（英文/字母占比过高会提示考虑重转）。
 
+**省心用法 —— 自动降级 `--fallback`**：给一串后端顺序，某个额度用尽/欠费时自动换下一个（其它错误不切、直接报错）。推荐顺序 = 省钱的在前：
+
+```bash
+python scripts/transcribe.py --from-meta ./_work --out ./_work --fallback paraformer,funasr,qwen --diarize --speaker-count 2 --language zh
+```
+
+（注：qwen 不支持说话人分离，若降级到它则该期无 `【说话人N】`。）
+
 产物：`./_work/transcript.txt`（纯文本）与 `./_work/transcript.srt`（带时间戳）。
 
 > ⚠️ 若都失败（付费内容/无 Key），**不要**用 shownotes 硬凑成"逐字稿笔记"。应如实告知用户没拿到转录，并让其在 front-matter 标注"整理依据：仅 shownotes（未转录）"。

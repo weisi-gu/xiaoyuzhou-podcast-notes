@@ -16,7 +16,21 @@ transcribe.py — 把音频转成文字。云端后端（阿里云百炼 DashSco
 音频来源：云端后端用公网 URL（推荐 --from-meta 自动读 meta.json 的 audio_url，无需下载）。
 产物：transcript.txt（纯文本；开分离时带【说话人N】标注）、transcript.srt（带时间戳）。
 """
-import argparse, os, sys, json, time, urllib.request
+import argparse, os, sys, json, time, urllib.request, urllib.error
+
+
+class QuotaExhausted(Exception):
+    """某模型免费额度用尽/欠费，可触发自动降级到下一个后端。"""
+
+
+# 额度不足/欠费的常见关键词（阿里云错误码或提示里出现即判定为额度问题）
+_QUOTA_KEYWORDS = ("arrear", "quota", "insufficient", "freeallocated", "allocationexceeded",
+                   "balance", "欠费", "额度", "余额", "配额", "免费额度")
+
+
+def _is_quota_error(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in _QUOTA_KEYWORDS)
 
 
 # ---------------- 通用输出 ----------------
@@ -72,11 +86,24 @@ def _dashscope_urls(region):
 
 def _submit_and_poll(submit_url, task_base, key, payload, out_dir):
     print("    提交异步任务...")
-    submit = _http_json(submit_url,
-        headers={"Authorization": f"Bearer {key}",
-                 "Content-Type": "application/json",
-                 "X-DashScope-Async": "enable"},
-        data=json.dumps(payload).encode(), method="POST", timeout=60)
+    try:
+        submit = _http_json(submit_url,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json",
+                     "X-DashScope-Async": "enable"},
+            data=json.dumps(payload).encode(), method="POST", timeout=60)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        if _is_quota_error(body) or e.code in (402, 429):
+            raise QuotaExhausted(f"HTTP {e.code}: {body[:300]}")
+        sys.exit(f"[错误] 提交失败 HTTP {e.code}：{body[:400]}")
+    # 提交返回里若带额度类错误码
+    if _is_quota_error(json.dumps(submit, ensure_ascii=False)) and not (submit.get("output") or {}).get("task_id"):
+        raise QuotaExhausted(json.dumps(submit, ensure_ascii=False)[:300])
     task_id = (submit.get("output") or {}).get("task_id")
     if not task_id:
         sys.exit(f"[错误] 未拿到 task_id：{json.dumps(submit, ensure_ascii=False)[:400]}")
@@ -90,7 +117,10 @@ def _submit_and_poll(submit_url, task_base, key, payload, out_dir):
         if st == "SUCCEEDED":
             print(); return q
         if st in ("FAILED", "CANCELED", "UNKNOWN"):
-            sys.exit(f"\n[错误] 任务 {st}：{json.dumps(q, ensure_ascii=False)[:500]}")
+            detail = json.dumps(q, ensure_ascii=False)
+            if _is_quota_error(detail):
+                raise QuotaExhausted(detail[:300])
+            sys.exit(f"\n[错误] 任务 {st}：{detail[:500]}")
     sys.exit("\n[错误] 轮询超时（>1 小时）。")
 
 
@@ -257,6 +287,9 @@ def main():
     ap.add_argument("--diarize", action="store_true", help="funasr/paraformer: 开启说话人分离")
     ap.add_argument("--speaker-count", type=int, default=None, help="说话人数量提示(2-100)")
     ap.add_argument("--vocabulary-id", default=None, help="热词表ID(vocabulary_id)，funasr/paraformer 支持")
+    ap.add_argument("--fallback", default=None,
+                    help="自动降级：给一串后端顺序（逗号分隔，如 paraformer,funasr,qwen），"
+                         "某个额度用尽/欠费时自动换下一个重试；其它错误不切、直接报错。设置后覆盖 --backend。")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -285,18 +318,35 @@ def main():
     if not audio:
         sys.exit("[用法] 需给出音频：本地路径、公网URL，或 --from-meta ./_work")
 
-    if args.backend == "qwen":
-        run_qwen(audio, args.out, args.model or "qwen3-asr-flash-filetrans",
-                 args.language, args.region)
-    elif args.backend == "funasr":
-        run_funasr(audio, args.out, args.model or "fun-asr", args.language,
-                   args.region, args.diarize, args.speaker_count, args.vocabulary_id)
-    elif args.backend == "paraformer":
-        # paraformer 与 fun-asr 用法一致（同接口/同参数），仅换模型名
-        run_funasr(audio, args.out, args.model or "paraformer-v2", args.language,
-                   args.region, args.diarize, args.speaker_count, args.vocabulary_id)
-    else:
-        run_api(audio, args.out, args.model or "whisper-large-v3", args.language)
+    def _run(backend):
+        if backend == "qwen":
+            run_qwen(audio, args.out, args.model or "qwen3-asr-flash-filetrans",
+                     args.language, args.region)
+        elif backend == "funasr":
+            run_funasr(audio, args.out, args.model or "fun-asr", args.language,
+                       args.region, args.diarize, args.speaker_count, args.vocabulary_id)
+        elif backend == "paraformer":
+            # paraformer 与 fun-asr 用法一致（同接口/同参数），仅换模型名
+            run_funasr(audio, args.out, args.model or "paraformer-v2", args.language,
+                       args.region, args.diarize, args.speaker_count, args.vocabulary_id)
+        else:
+            run_api(audio, args.out, args.model or "whisper-large-v3", args.language)
+
+    # 后端链：--fallback 优先（自动降级），否则单个 --backend
+    chain = [b.strip() for b in args.fallback.split(",") if b.strip()] if args.fallback else [args.backend]
+    if args.diarize and "qwen" in chain:
+        print("[提示] qwen 不支持说话人分离；若降级到 qwen，该期将不带【说话人N】标注。")
+    for i, backend in enumerate(chain):
+        try:
+            if len(chain) > 1:
+                print(f"[后端 {i+1}/{len(chain)}] 尝试 {backend} ...")
+            _run(backend)
+            return  # 成功即结束
+        except QuotaExhausted as e:
+            if i + 1 < len(chain):
+                print(f"[降级] {backend} 额度用尽/欠费，自动改用下一个：{chain[i+1]}\n    （原因：{str(e)[:120]}）")
+            else:
+                sys.exit(f"[错误] 所有后端额度均已用尽/欠费（最后尝试 {backend}）。请充值或换地域后重试。")
 
 
 if __name__ == "__main__":
